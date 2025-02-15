@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+transformers
+datasets
+nltk
+gensim
+scikit-learn
+numpy
+pandas
