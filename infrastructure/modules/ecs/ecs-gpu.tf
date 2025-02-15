@@ -1,12 +1,21 @@
+data "aws_ssm_parameter" "ecs_gpu_ami" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id"
+}
+
 resource "aws_launch_template" "ecs_gpu" {
   name          = "ecs-gpu-template"
-  image_id      = "ami-02ca4fbacf5f85ce5"  # ECS-optimized Amazon Linux 2 AMI with OSS NVIDIA driver & PyTorch
+  image_id      = data.aws_ssm_parameter.ecs_gpu_ami.value # ECS-optimized Amazon Linux 2 AMI with OSS NVIDIA driver & PyTorch
   instance_type = "g4dn.2xlarge"
-
+  user_data = base64encode(<<EOF
+#!/bin/bash
+echo "ECS_CLUSTER=scaled-rag-cluster" >> /etc/ecs/ecs.config
+echo "ECS_ENABLE_GPU_SUPPORT=true" >> /etc/ecs/ecs.config
+EOF
+  )
   iam_instance_profile {
     name = aws_iam_instance_profile.ecs_instance_profile.name
   }
-
+  key_name = "ecs-rag"
   block_device_mappings {
     device_name = "/dev/xvda"
     ebs {
@@ -28,18 +37,12 @@ resource "aws_launch_template" "ecs_gpu" {
     }
   }
 
-  user_data = base64encode(<<EOF
-#!/bin/bash
-# Configure the ECS agent to join your cluster
-echo "ECS_CLUSTER=scaled-rag-cluster" >> /etc/ecs/ecs.config
-EOF
-  )
 }
 
 resource "aws_autoscaling_group" "ecs_asg" {
-  desired_capacity    = 1
+  desired_capacity    = 2
   max_size            = 2
-  min_size            = 1
+  min_size            = 2
   vpc_zone_identifier = var.public_subnets
 
 
@@ -54,3 +57,9 @@ resource "aws_autoscaling_group" "ecs_asg" {
     propagate_at_launch = true
   }
 }
+
+resource "aws_cloudwatch_log_group" "rag_logs" {
+  name              = "/ecs/rag-service"
+  retention_in_days = 7
+}
+

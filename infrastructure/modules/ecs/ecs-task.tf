@@ -3,7 +3,8 @@ resource "aws_ecs_task_definition" "rag_task" {
   requires_compatibilities = ["EC2"]
   memory                   = "8192"
   cpu                      = "4096"
-
+  network_mode             = "bridge"
+  
   container_definitions = jsonencode([
     {
       name         = "rag-container"
@@ -14,9 +15,17 @@ resource "aws_ecs_task_definition" "rag_task" {
       resourceRequirements = [
         {
           type  = "GPU"
-          value = "2"
+          value = "1"
         }
       ]
+      "logConfiguration" : {
+        "logDriver" : "awslogs",
+        "options"   : {
+          "awslogs-group"         : "/ecs/rag-service",
+          "awslogs-region"        : "us-east-1",
+          "awslogs-stream-prefix" : "rag-container"
+        }
+      }
       portMappings = [
         {
           containerPort = 8000

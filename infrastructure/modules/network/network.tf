@@ -7,16 +7,18 @@ resource "aws_vpc" "rag_vpc" {
 
 resource "aws_internet_gateway" "rag_igw" {
   vpc_id = aws_vpc.rag_vpc.id
+  tags   = { Name = "rag-igw" }
 }
 
 resource "aws_route_table" "rag_route_table" {
   vpc_id = aws_vpc.rag_vpc.id
-}
 
-resource "aws_route" "internet_access" {
-  route_table_id         = aws_route_table.rag_route_table.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.rag_igw.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.rag_igw.id
+  }
+
+  tags = { Name = "rag-public-rt" }
 }
 
 resource "aws_subnet" "public_subnet" {
@@ -24,6 +26,7 @@ resource "aws_subnet" "public_subnet" {
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
   availability_zone       = "us-east-1a"
+  tags = { Name = "public-subnet-a" }
 }
 
 resource "aws_subnet" "public_subnet_b" {
@@ -31,16 +34,29 @@ resource "aws_subnet" "public_subnet_b" {
   cidr_block              = "10.0.2.0/24"
   map_public_ip_on_launch = true
   availability_zone       = "us-east-1b"
+  tags = { Name = "public-subnet-b" }
 }
 
-resource "aws_route_table_association" "public_subnet_association" {
+resource "aws_route_table_association" "public_subnet_association_a" {
   subnet_id      = aws_subnet.public_subnet.id
+  route_table_id = aws_route_table.rag_route_table.id
+}
+
+resource "aws_route_table_association" "public_subnet_association_b" {
+  subnet_id      = aws_subnet.public_subnet_b.id
   route_table_id = aws_route_table.rag_route_table.id
 }
 
 resource "aws_security_group" "ecs_sg" {
   name   = "ecs-sg"
   vpc_id = aws_vpc.rag_vpc.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   ingress {
     from_port   = 80
@@ -62,4 +78,6 @@ resource "aws_security_group" "ecs_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "ecs-sg" }
 }
