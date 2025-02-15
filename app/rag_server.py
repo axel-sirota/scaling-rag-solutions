@@ -187,6 +187,12 @@ logging.info(f"Main process: Launched {len(workers)} worker(s).")
 #########################################
 app = FastAPI()
 
+# Health Check Endpoint
+@app.get("/")
+def health_check():
+    return {"status": "healthy"}
+
+
 class QueryRequest(BaseModel):
     query: str
 
