@@ -7,6 +7,7 @@ resource "aws_lb" "rag_alb" {
   security_groups    = [var.ecs_sg_id]
   subnets            = var.public_subnets
   internal           = false
+  idle_timeout       = 600
 }
 
 resource "aws_lb_target_group" "rag_tg" {
@@ -15,6 +16,8 @@ resource "aws_lb_target_group" "rag_tg" {
   protocol = "HTTP"
   vpc_id   = var.vpc_id
 
+  # ALB health check on "/"
+  # => The server returns 200 once the FAISS index is built.
   health_check {
     path                = "/"
     port                = "traffic-port"
