@@ -11,6 +11,7 @@ import threading
 import atexit
 import logging
 import re
+import time  # NEW: for timing
 
 from fastapi import FastAPI, Response
 from pydantic import BaseModel
@@ -27,6 +28,9 @@ docs = None
 
 # For concurrency / safety if needed
 index_lock = threading.Lock()
+
+# Track whether each worker (GPU) has finished model loading
+WORKER_READY = []
 
 # ------------------------
 # Logging Setup
@@ -97,6 +101,10 @@ def build_faiss_index():
 # Worker Process Function
 # ------------------------
 def worker_process(gpu_id, input_queue, output_queue):
+    """
+    Each worker runs in its own process, loads its GPU-specific models,
+    then handles inference queries from the input_queue.
+    """
     init_logging()
     logging.info(f"Worker on GPU {gpu_id}: Starting process.")
 
@@ -120,10 +128,11 @@ def worker_process(gpu_id, input_queue, output_queue):
     emb_model_gpu = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").to(device)
     emb_model_gpu.eval()
 
-    logging.info(f"Worker on GPU {gpu_id}: Models loaded successfully.")
+    logging.info(f"Worker on GPU {gpu_id}: Models loaded successfully. Sending ready signal...")
+    # Signal to main that this worker has finished loading
+    output_queue.put({"msg_type": "ready", "gpu_id": gpu_id})
 
     # IMPORTANT: Use the global docs and faiss_index that were built in the main process.
-    # Because we're in a separate process, this only works cleanly on Linux with 'fork'.
     global docs, faiss_index
 
     def clean_and_tokenize(text: str) -> str:
@@ -133,7 +142,6 @@ def worker_process(gpu_id, input_queue, output_queue):
         tokens = simple_preprocess(text)
         return " ".join(tokens)
 
-    # Now we enter the main loop for handling queries
     logging.info(f"Worker on GPU {gpu_id}: Ready to process queries.")
     while True:
         task = input_queue.get()
@@ -145,49 +153,34 @@ def worker_process(gpu_id, input_queue, output_queue):
         query_text = task["query"]
         logging.info(f"Worker on GPU {gpu_id}: Received job {job_id} with query: '{query_text}'")
         # 1. Embed the query
-        logging.debug(f"Worker on GPU {gpu_id}: Cleaning and tokenizing query: '{query_text}'")
         cleaned_query = clean_and_tokenize(query_text)
-        logging.debug(f"Worker on GPU {gpu_id}: Cleaned query: '{cleaned_query}'")
-        
-        logging.debug(f"Worker on GPU {gpu_id}: Tokenizing query for embedding.")
         tokens = emb_tokenizer_gpu(cleaned_query, return_tensors="pt", truncation=True, max_length=512)
         tokens = {k: v.to(device) for k, v in tokens.items()}
-        logging.debug(f"Worker on GPU {gpu_id}: Tokens: {tokens}")
-
         with torch.no_grad():
-            logging.debug(f"Worker on GPU {gpu_id}: Generating query embedding.")
             query_emb = emb_model_gpu(**tokens).last_hidden_state.mean(dim=1).cpu().numpy()
-        logging.debug(f"Worker on GPU {gpu_id}: Query embedding generated.")
 
         # 2. Retrieve top-k passages from FAISS
         k = 5
-        logging.debug(f"Worker on GPU {gpu_id}: Searching FAISS index for top-{k} passages.")
         distances, indices = faiss_index.search(query_emb, k)
-        logging.debug(f"Worker on GPU {gpu_id}: Retrieved indices: {indices}, distances: {distances}")
         retrieved_passages = [docs[idx] for idx in indices[0]]
-        logging.debug(f"Worker on GPU {gpu_id}: Retrieved passages: {retrieved_passages}")
 
         # 3. Generate an answer
         context = "\n".join(retrieved_passages)
         prompt = f"Question: {query_text}\nContext: {context}\nAnswer:"
-        logging.debug(f"Worker on GPU {gpu_id}: Generated prompt for answer generation: '{prompt}'")
         
         encoded = gen_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
-        logging.debug(f"Worker on GPU {gpu_id}: Encoded prompt: {encoded}")
 
         with torch.no_grad():
-            logging.debug(f"Worker on GPU {gpu_id}: Generating answer.")
             outputs = gen_model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=150,
-            num_beams=5,
-            early_stopping=True
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=150,
+                num_beams=5,
+                early_stopping=True
             )
         generated_answer = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logging.debug(f"Worker on GPU {gpu_id}: Generated answer: '{generated_answer}'")
 
         result = {
             "job_id": job_id,
@@ -210,16 +203,6 @@ class WorkerClient:
         self.process = process
         self.lock = threading.Lock()
 
-# List of worker clients
-workers = []
-worker_index = 0
-num_gpus = torch.cuda.device_count()
-if num_gpus == 0:
-    logging.warning("No GPUs detected. Falling back to CPU. Creating one worker.")
-    num_gpus = 1
-
-logging.info(f"Main process: Detected {num_gpus} GPU(s).")
-
 # ------------------------
 # FastAPI App
 # ------------------------
@@ -227,18 +210,38 @@ app = FastAPI()
 
 @app.get("/")
 def health_check():
-    """Return 200 only if the index is built (INDEX_READY). Otherwise 503."""
+    """
+    Return 200 only if the FAISS index is built (INDEX_READY). Otherwise 503.
+    This does NOT check if all GPU models are loaded – just the index.
+    """
     global INDEX_READY
     with index_lock:
         if not INDEX_READY:
             return Response(status_code=503, content="Index not ready")
     return {"status": "healthy"}
 
+@app.get("/models_ready")
+def models_ready():
+    """
+    Returns a dictionary indicating model-loaded status for each GPU.
+    Example: { "gpu_0": true, "gpu_1": false, ... }
+    """
+    global WORKER_READY
+    status_dict = {}
+    for i, ready in enumerate(WORKER_READY):
+        status_dict[f"gpu_{i}"] = ready
+    return status_dict
+
 class QueryRequest(BaseModel):
     query: str
 
 @app.post("/rag")
 def rag_endpoint(request: QueryRequest):
+    """
+    Endpoint that accepts a query string and returns:
+      - The retrieved top passages
+      - The generated answer
+    """
     global worker_index
     query_text = request.query
     job_id = str(uuid.uuid4())
@@ -274,14 +277,27 @@ atexit.register(shutdown_workers)
 # Main Entry Point
 # ------------------------
 if __name__ == "__main__":
+    start_time = time.time()  # For measuring total load time
+
+    # Initialize worker readiness tracking
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        logging.warning("No GPUs detected. Falling back to CPU. Creating one worker.")
+        num_gpus = 1
+
+    WORKER_READY = [False] * num_gpus
+    logging.info(f"Main process: Detected {num_gpus} GPU(s).")
+
     # 1) Build the FAISS index ONCE in the main process
     with index_lock:
         docs, faiss_index = build_faiss_index()
-        # Mark index ready
-        INDEX_READY = True
+        INDEX_READY = True  # Mark index ready
 
     # 2) Spawn one worker per GPU
     logging.info(f"Main process: Launching {num_gpus} workers...")
+    workers = []
+    worker_index = 0
+
     for gpu_id in range(num_gpus):
         in_q = mp.Queue()
         out_q = mp.Queue()
@@ -289,5 +305,18 @@ if __name__ == "__main__":
         p.start()
         workers.append(WorkerClient(gpu_id, in_q, out_q, p))
 
-    logging.info("Main process: All workers launched. Starting FastAPI server on port 8000.")
+    # 3) Wait for each worker to signal it has loaded its models
+    for w in workers:
+        msg = w.output_queue.get()  # Blocking wait for "ready" message
+        if msg.get("msg_type") == "ready":
+            gpu_id = msg.get("gpu_id")
+            WORKER_READY[gpu_id] = True
+            logging.info(f"Main process: Worker on GPU {gpu_id} is ready.")
+
+    end_time = time.time()
+    total_load_time = end_time - start_time
+    logging.info(f"All GPU processes have loaded. Total load time: {total_load_time:.2f} seconds")
+
+    # 4) Start FastAPI server only after all models are loaded
+    logging.info("Main process: Starting FastAPI server on port 8000.")
     uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=600)
