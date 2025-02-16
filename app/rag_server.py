@@ -290,4 +290,4 @@ if __name__ == "__main__":
         workers.append(WorkerClient(gpu_id, in_q, out_q, p))
 
     logging.info("Main process: All workers launched. Starting FastAPI server on port 8000.")
-    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=300)
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=600)
