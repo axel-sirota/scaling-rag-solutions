@@ -61,7 +61,7 @@ def build_faiss_index():
     # Load dataset passages
     logging.info("Main process: Loading dataset passages...")
     dataset = load_dataset("rag-datasets/rag-mini-bioasq", "text-corpus", split="passages")
-    all_docs = [doc["passage"] for doc in dataset][:10000]
+    all_docs = [doc["passage"] for doc in dataset][:2000]
     logging.info(f"Main process: Loaded {len(all_docs)} passages.")
 
     # For embedding, we only need a tokenizer + model on CPU here
@@ -144,35 +144,50 @@ def worker_process(gpu_id, input_queue, output_queue):
         job_id = task["job_id"]
         query_text = task["query"]
         logging.info(f"Worker on GPU {gpu_id}: Received job {job_id} with query: '{query_text}'")
-
         # 1. Embed the query
+        logging.debug(f"Worker on GPU {gpu_id}: Cleaning and tokenizing query: '{query_text}'")
         cleaned_query = clean_and_tokenize(query_text)
+        logging.debug(f"Worker on GPU {gpu_id}: Cleaned query: '{cleaned_query}'")
+        
+        logging.debug(f"Worker on GPU {gpu_id}: Tokenizing query for embedding.")
         tokens = emb_tokenizer_gpu(cleaned_query, return_tensors="pt", truncation=True, max_length=512)
         tokens = {k: v.to(device) for k, v in tokens.items()}
+        logging.debug(f"Worker on GPU {gpu_id}: Tokens: {tokens}")
+
         with torch.no_grad():
+            logging.debug(f"Worker on GPU {gpu_id}: Generating query embedding.")
             query_emb = emb_model_gpu(**tokens).last_hidden_state.mean(dim=1).cpu().numpy()
+        logging.debug(f"Worker on GPU {gpu_id}: Query embedding generated.")
 
         # 2. Retrieve top-k passages from FAISS
         k = 5
+        logging.debug(f"Worker on GPU {gpu_id}: Searching FAISS index for top-{k} passages.")
         distances, indices = faiss_index.search(query_emb, k)
+        logging.debug(f"Worker on GPU {gpu_id}: Retrieved indices: {indices}, distances: {distances}")
         retrieved_passages = [docs[idx] for idx in indices[0]]
+        logging.debug(f"Worker on GPU {gpu_id}: Retrieved passages: {retrieved_passages}")
 
         # 3. Generate an answer
         context = "\n".join(retrieved_passages)
         prompt = f"Question: {query_text}\nContext: {context}\nAnswer:"
+        logging.debug(f"Worker on GPU {gpu_id}: Generated prompt for answer generation: '{prompt}'")
+        
         encoded = gen_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
+        logging.debug(f"Worker on GPU {gpu_id}: Encoded prompt: {encoded}")
 
         with torch.no_grad():
+            logging.debug(f"Worker on GPU {gpu_id}: Generating answer.")
             outputs = gen_model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=150,
-                num_beams=5,
-                early_stopping=True
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=150,
+            num_beams=5,
+            early_stopping=True
             )
         generated_answer = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logging.debug(f"Worker on GPU {gpu_id}: Generated answer: '{generated_answer}'")
 
         result = {
             "job_id": job_id,

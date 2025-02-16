@@ -1,16 +1,12 @@
+############################################
+# ALB with Access Logs
+############################################
 resource "aws_lb" "rag_alb" {
   name               = "rag-load-balancer"
-  internal           = false
   load_balancer_type = "application"
   security_groups    = [var.ecs_sg_id]
   subnets            = var.public_subnets
-  access_logs {
-    bucket = aws_s3_bucket.alb_logs.bucket
-    prefix = "alb"
-    enabled = true
-  }
-  idle_timeout       = 300  # or 300, or however many seconds you want
-
+  internal           = false
 }
 
 resource "aws_lb_target_group" "rag_tg" {
@@ -40,9 +36,4 @@ resource "aws_lb_listener" "http" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.rag_tg.arn
   }
-}
-
-resource "aws_s3_bucket" "alb_logs" {
-  bucket = "my-rag-alb-logs"
-  acl    = "private"
 }
