@@ -1,18 +1,15 @@
 import os
+import os
 import sys
 import re
 import time
 import uuid
 import logging
-import atexit
 import threading
-import multiprocessing as mp
 
-# Disable huggingface tokenizer parallelism warnings
+# Ensure clearer CUDA errors & disable parallel tokenizer warnings
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# If you want to avoid fork issues on Linux, uncomment:
-# mp.set_start_method("spawn", force=True)
 
 import torch
 import faiss
@@ -23,291 +20,127 @@ from fastapi import FastAPI, Response
 from pydantic import BaseModel
 from datasets import load_dataset
 from gensim.utils import simple_preprocess
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 
 # ------------------------
-# Global Config & Variables
+# Globals
 # ------------------------
-LOG_LEVEL = logging.INFO  # Or logging.DEBUG if you want more verbose
+LOG_LEVEL = logging.INFO
 INDEX_READY = False
 faiss_index = None
 docs = None
 
 index_lock = threading.Lock()
 
-workers = []
-worker_index = 0
+gpu_models = []
+gpu_index = 0  # Round-robin across GPUs
 
-WORKER_READY = []  # We'll populate once we know the number of GPUs
+MODEL_MAX_LENGTH = 1024       # DialoGPT context window (small model)
+NEW_TOKENS = 150              # We want 150 tokens for the generation tail
+PROMPT_MAX_TOKENS = MODEL_MAX_LENGTH - NEW_TOKENS  # 874
+K_RETRIEVE = 2                # We'll retrieve top-2 passages from FAISS
 
 # ------------------------
-# Main Process: Log Setup
+# Logging
 # ------------------------
-def init_main_logger():
-    """
-    Prepare the root logger in the main process.
-    We'll just attach a single StreamHandler for console output.
-    """
+def init_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(LOG_LEVEL)
 
-    # Remove any existing handlers to start fresh
     for h in root_logger.handlers[:]:
         root_logger.removeHandler(h)
 
-    # Create a stream handler for stdout
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(
-        "[%(asctime)s] [PID %(process)d] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    fmt = "[%(asctime)s] [PID %(process)d] [%(levelname)s] %(message)s"
+    formatter = logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S")
     handler.setFormatter(formatter)
     root_logger.addHandler(handler)
 
-def log_receiver(log_queue):
-    """
-    Runs in a background thread in the main process.
-    Receives logging.LogRecord objects from worker processes and logs them locally.
-    """
-    root_logger = logging.getLogger()
-    while True:
-        record = log_queue.get()
-        if record is None:
-            # This is our shutdown signal
-            break
-        # Re-emit the record in the main process
-        root_logger.handle(record)
-
-class MultiprocessLogHandler(logging.Handler):
-    """
-    A custom logging handler that sends LogRecords through a multiprocessing.Queue
-    to the main process.
-    """
-    def __init__(self, log_queue):
-        super().__init__()
-        self.log_queue = log_queue
-
-    def emit(self, record):
-        try:
-            # Make a copy of the record just in case
-            # Remove any exception info that might not be pickleable
-            record.exc_info = None
-            record.exc_text = None
-            # record.args might be unpickleable sometimes – typically it's fine.
-
-            # Send the record to the queue
-            self.log_queue.put(record)
-        except Exception:
-            pass
-
-def init_worker_logger(log_queue):
-    """
-    Configure the worker's root logger to send all logs to MultiprocessLogHandler,
-    which forwards them to the main process via log_queue.
-    """
-    worker_logger = logging.getLogger()
-    worker_logger.setLevel(LOG_LEVEL)
-
-    # Remove any default or inherited handlers
-    for h in worker_logger.handlers[:]:
-        worker_logger.removeHandler(h)
-
-    # Add our multiprocess handler
-    mp_handler = MultiprocessLogHandler(log_queue)
-    worker_logger.addHandler(mp_handler)
+init_logging()
+logging.info("Main: Logging initialized.")
 
 # ------------------------
-# Pre-download Models in Main
-# ------------------------
-def preload_models():
-    """
-    Download/cache all models in the main process so workers can load from disk 
-    rather than downloading from the internet (which can cause blocking).
-    """
-    model_list = [
-        "microsoft/DialoGPT-small",             # generative model
-        "sentence-transformers/all-MiniLM-L6-v2"  # embedding model
-    ]
-    for model_name in model_list:
-        logging.info(f"Main process: Pre-downloading model/tokenizer '{model_name}'...")
-        # For generative
-        _ = AutoModelForCausalLM.from_pretrained(model_name)
-        _ = AutoTokenizer.from_pretrained(model_name)
-        # If it's an embedding model, we also want AutoModel (not AutoModelForCausalLM)
-        if "sentence-transformers" in model_name:
-            _ = AutoModel.from_pretrained(model_name)
-    logging.info("Main process: All required models are now cached locally.")
-
-# ------------------------
-# Build FAISS Index
+# Build FAISS
 # ------------------------
 def build_faiss_index():
-    logging.info("Main process: Starting to build FAISS index...")
+    logging.info("Main: Starting to build FAISS index...")
 
     # Load dataset passages
-    logging.info("Main process: Loading dataset passages...")
+    logging.info("Main: Loading dataset passages...")
     dataset = load_dataset("rag-datasets/rag-mini-bioasq", "text-corpus", split="passages")
     all_docs = [doc["passage"] for doc in dataset][:2000]
-    logging.info(f"Main process: Loaded {len(all_docs)} passages.")
+    logging.info(f"Main: Loaded {len(all_docs)} passages.")
 
-    # For embedding, we only need CPU
+    # CPU-based embedding
     emb_tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
     emb_model_cpu = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").cpu()
     emb_model_cpu.eval()
-    logging.info("Main process: Loaded embedding model.")
 
-    def clean_and_tokenize(text: str) -> str:
-        text = re.sub(r"\s+", " ", text)
-        text = text.lower()
-        text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
-        tokens = simple_preprocess(text)
-        return " ".join(tokens)
+    def clean_and_tokenize(txt: str) -> str:
+        txt = re.sub(r"\s+", " ", txt)
+        txt = txt.lower()
+        txt = re.sub(r"[^a-zA-Z0-9\s]", "", txt)
+        return " ".join(simple_preprocess(txt))
 
     index_dim = 384
     index = faiss.IndexFlatL2(index_dim)
 
-    logging.info(f"Main process: Building FAISS index (dim={index_dim})...")
+    logging.info(f"Main: Building FAISS index (dim={index_dim})...")
     for i, passage in enumerate(all_docs):
-        cleaned_doc = clean_and_tokenize(passage)
-        tokens = emb_tokenizer(cleaned_doc, return_tensors="pt", truncation=True, max_length=512)
+        cleaned = clean_and_tokenize(passage)
+        tokens = emb_tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=512)
         with torch.no_grad():
             emb = emb_model_cpu(**tokens).last_hidden_state.mean(dim=1).cpu().numpy()
         index.add(emb)
         if (i + 1) % 1000 == 0:
-            logging.debug(f"Main process: Indexed {i+1} passages...")
+            logging.debug(f"Main: Indexed {i+1} passages...")
 
-    logging.info(f"Main process: Finished building FAISS index with {index.ntotal} vectors.")
+    logging.info(f"Main: Finished building FAISS index with {index.ntotal} vectors.")
     return all_docs, index
 
 # ------------------------
-# Worker Process Function
+# Load GPU Models
 # ------------------------
-def worker_process(gpu_id, input_queue, output_queue, log_queue):
-    # 1) Set up logging in the worker to forward everything to main
-    init_worker_logger(log_queue)
-    logging.info(f"Worker on GPU {gpu_id}: Starting process.")
-
+def load_models_for_gpu(gpu_id: int):
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Worker on GPU {gpu_id}: Using device {device}.")
+    logging.info(f"Main: Loading models for GPU {gpu_id} on device {device}...")
 
-    # 2) Load generative model + tokenizer
+    # Generative model
     MODEL_NAME = "microsoft/DialoGPT-small"
     gen_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if gen_tokenizer.pad_token is None:
         gen_tokenizer.pad_token = gen_tokenizer.eos_token
-    logging.info(f"Worker on GPU {gpu_id}: Loaded generative tokenizer.")
     gen_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(device)
     gen_model.eval()
-    logging.info(f"Worker on GPU {gpu_id}: Loaded generative model.")
 
-    # 3) Load embedding model + tokenizer on GPU
-    emb_tokenizer_gpu = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    logging.info(f"Worker on GPU {gpu_id}: Loaded embedding tokenizer.")
-    emb_model_gpu = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").to(device)
-    emb_model_gpu.eval()
-    logging.info(f"Worker on GPU {gpu_id}: Loaded embedding model.")
+    # Embedding model
+    EMB_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+    emb_tokenizer = AutoTokenizer.from_pretrained(EMB_NAME)
+    emb_model = AutoModel.from_pretrained(EMB_NAME).to(device)
+    emb_model.eval()
 
-    logging.info(f"Worker on GPU {gpu_id}: Models loaded successfully. Sending ready signal...")
-    output_queue.put({"msg_type": "ready", "gpu_id": gpu_id})
+    logging.info(f"Main: GPU {gpu_id} models loaded successfully.")
+    return {
+        "device": device,
+        "gen_tokenizer": gen_tokenizer,
+        "gen_model": gen_model,
+        "emb_tokenizer": emb_tokenizer,
+        "emb_model": emb_model,
+    }
 
-    global docs, faiss_index
-
-    def clean_and_tokenize(text: str) -> str:
-        text = re.sub(r"\s+", " ", text)
-        text = text.lower()
-        text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
-        tokens = simple_preprocess(text)
-        return " ".join(tokens)
-
-    logging.info(f"Worker on GPU {gpu_id}: Ready to process queries.")
-    while True:
-        task = input_queue.get()
-        if task is None:
-            logging.info(f"Worker on GPU {gpu_id}: Received shutdown signal.")
-            break
-
-        job_id = task["job_id"]
-        query_text = task["query"]
-        logging.info(f"Worker on GPU {gpu_id}: Received job {job_id} with query: '{query_text}'")
-
-        # 1. Embed the query
-        cleaned_query = clean_and_tokenize(query_text)
-        logging.info(f"Worker on GPU {gpu_id}: Cleaned query: '{cleaned_query}'")
-        tokens = emb_tokenizer_gpu(cleaned_query, return_tensors="pt", truncation=True, max_length=512)
-        tokens = {k: v.to(device) for k, v in tokens.items()}
-        logging.info(f"Worker on GPU {gpu_id}: Tokenized query {query_text}, ready to send to embedding model")
-        with torch.no_grad():
-            query_emb = emb_model_gpu(**tokens).last_hidden_state.mean(dim=1).cpu().numpy()
-
-        # 2. Retrieve top-k passages
-        k = 5
-        distances, indices = faiss_index.search(query_emb, k)
-        retrieved_passages = [docs[idx] for idx in indices[0]]
-
-        # 3. Generate an answer
-        context = "\n".join(retrieved_passages)
-        logging.info(f"Worker on GPU {gpu_id}: Retrieved passages for query {query_text}, passages are {len(retrieved_passages)}")
-        prompt = f"Question: {query_text}\nContext: {context}\nAnswer:"
-        encoded = gen_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(device)
-        logging.info(f"Worker on GPU {gpu_id}: Generated prompt for query {query_text}, ready to generate answer")
-        with torch.no_grad():
-            outputs = gen_model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=150,
-                num_beams=5,
-                early_stopping=True
-            )
-        generated_answer = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logging.info(f"Worker on GPU {gpu_id}: Generated answer for query {query_text}")
-
-        result = {
-            "job_id": job_id,
-            "query": query_text,
-            "retrieved_passages": retrieved_passages,
-            "generated_answer": generated_answer,
-        }
-        output_queue.put(result)
-
-    logging.info(f"Worker on GPU {gpu_id}: Exiting process.")
+def clean_text_for_embedding(txt: str) -> str:
+    txt = re.sub(r"\s+", " ", txt)
+    txt = txt.lower()
+    txt = re.sub(r"[^a-zA-Z0-9\s]", "", txt)
+    return " ".join(simple_preprocess(txt))
 
 # ------------------------
-# WorkerClient Class
-# ------------------------
-class WorkerClient:
-    def __init__(self, gpu_id, input_queue, output_queue, process):
-        self.gpu_id = gpu_id
-        self.input_queue = input_queue
-        self.output_queue = output_queue
-        self.process = process
-        self.lock = threading.Lock()
-
-# ------------------------
-# Background Thread to Wait for Worker "ready"
-# ------------------------
-def watch_workers_loaded(worker_list):
-    global WORKER_READY
-    for i, w in enumerate(worker_list):
-        msg = w.output_queue.get()  # blocking
-        if msg.get("msg_type") == "ready":
-            gpu_id = msg["gpu_id"]
-            WORKER_READY[gpu_id] = True
-            logging.info(f"Main process: Worker on GPU {gpu_id} is ready. ({i+1}/{len(worker_list)})")
-
-    logging.info("Main process: All workers have signaled they are loaded.")
-
-# ------------------------
-# FastAPI App
+# FastAPI
 # ------------------------
 app = FastAPI()
 
 @app.get("/")
 def health_check():
-    """
-    Returns 200 if the index is built; otherwise 503.
-    """
     global INDEX_READY
     with index_lock:
         if not INDEX_READY:
@@ -316,13 +149,10 @@ def health_check():
 
 @app.get("/models_ready")
 def models_ready():
-    """
-    Returns JSON for each GPU: { "gpu_0": true, "gpu_1": false, ... }
-    """
-    status = {}
-    for gpu_id, is_ready in enumerate(WORKER_READY):
-        status[f"gpu_{gpu_id}"] = is_ready
-    return status
+    return {
+        "num_gpus": len(gpu_models),
+        "gpu_ids": list(range(len(gpu_models))),
+    }
 
 class QueryRequest(BaseModel):
     query: str
@@ -330,101 +160,128 @@ class QueryRequest(BaseModel):
 @app.post("/rag")
 def rag_endpoint(request: QueryRequest):
     """
-    Round-robin a query to whichever GPU worker is next in line (if ready).
+    Single-process RAG:
+      1) Round-robin pick GPU model.
+      2) Embed the query.
+      3) Retrieve top-2 from FAISS (K_RETRIEVE=2).
+      4) Build prompt. If prompt would exceed 874 tokens, forcibly trim it.
+      5) Generate up to NEW_TOKENS=150.
+      6) Return only the last NEW_TOKENS tokens from generation.
     """
-    global worker_index
+    global gpu_index
+    if len(gpu_models) == 0:
+        return Response(status_code=503, content="No GPUs loaded.")
+
+    idx = gpu_index % len(gpu_models)
+    gpu_index += 1
+    model_data = gpu_models[idx]
+
+    device = model_data["device"]
     query_text = request.query
     job_id = str(uuid.uuid4())
-    logging.info(f"Main process: Received new query job_id={job_id}: '{query_text}'")
+    logging.info(f"Main: RAG job={job_id}, query='{query_text}' -> GPU idx={idx}, device={device}")
 
-    if len(workers) == 0:
-        return Response(status_code=503, content="No workers available")
+    # 1) Embed query
+    cleaned_query = clean_text_for_embedding(query_text)
+    emb_tok = model_data["emb_tokenizer"]
+    emb_model = model_data["emb_model"]
 
-    # Round-robin
-    worker = workers[worker_index % len(workers)]
-    worker_index += 1
+    tokens = emb_tok(
+        cleaned_query,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding="longest"
+    ).to(device)
 
-    if not WORKER_READY[worker.gpu_id]:
-        logging.warning(f"Worker on GPU {worker.gpu_id} not ready yet. Returning 503.")
-        return Response(status_code=503, content=f"Worker {worker.gpu_id} not ready")
+    with torch.no_grad():
+        query_emb = emb_model(**tokens).last_hidden_state.mean(dim=1).cpu().numpy()
 
-    # Dispatch the task
-    with worker.lock:
-        worker.input_queue.put({"job_id": job_id, "query": query_text})
-        result = worker.output_queue.get()
+    # 2) Retrieve top-2
+    dists, idxs = faiss_index.search(query_emb, K_RETRIEVE)
+    retrieved_passages = [docs[i] for i in idxs[0]]
 
-    logging.info(f"Main process: Job {job_id} completed. Returning result.")
-    return result
+    # 3) Build prompt
+    context = "\n".join(retrieved_passages)
+    prompt = f"Question: {query_text}\nContext: {context}\nAnswer:"
+    gen_tok = model_data["gen_tokenizer"]
+    gen_model_ref = model_data["gen_model"]
+
+    # We'll forcibly ensure the prompt is at most PROMPT_MAX_TOKENS
+    enc = gen_tok(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=PROMPT_MAX_TOKENS,
+        padding="longest"
+    )
+    # If no attention_mask, create one
+    if "attention_mask" not in enc:
+        enc["attention_mask"] = torch.ones_like(enc["input_ids"])
+
+    # Move to GPU
+    enc = {k: v.to(device) for k, v in enc.items()}
+    prompt_len = enc["input_ids"].shape[1]
+    logging.info(f"Main: Prompt tokens={prompt_len}, leaving {MODEL_MAX_LENGTH - prompt_len} for generation.")
+
+    # 4) Generate
+    with torch.no_grad():
+        out_ids = gen_model_ref.generate(
+            enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=NEW_TOKENS,
+            num_beams=1,
+            do_sample=False,
+            early_stopping=True,
+        )
+    total_len = out_ids.shape[1]
+    generated_len = total_len - prompt_len
+    logging.info(f"Main: Generated {generated_len} new tokens (out of {NEW_TOKENS} possible).")
+
+    if generated_len <= 0:
+        # No new tokens generated
+        final_tokens = out_ids[0, -1:]
+    else:
+        new_tokens = out_ids[0, prompt_len:]
+        # If it somehow generated more than 150, keep last 150
+        if new_tokens.shape[0] > NEW_TOKENS:
+            new_tokens = new_tokens[-NEW_TOKENS:]
+        final_tokens = new_tokens
+
+    final_answer = gen_tok.decode(out_ids[0], skip_special_tokens=True)
+
+    logging.info(f"Main: RAG job={job_id} completed. Returning last {NEW_TOKENS} tokens only.")
+    return {"answer": final_answer}
 
 # ------------------------
-# Shutdown Hook
-# ------------------------
-def shutdown_workers():
-    logging.info("Main process: Shutting down all workers...")
-    for w in workers:
-        logging.info(f"Main process: Sending shutdown signal to worker on GPU {w.gpu_id}...")
-        w.input_queue.put(None)
-        w.process.join()
-    logging.info("Main process: All workers shut down.")
-
-atexit.register(shutdown_workers)
-
-# ------------------------
-# Main Entry Point
+# Main
 # ------------------------
 if __name__ == "__main__":
-    # 1) Set up the main logger to console
-    init_main_logger()
-
-    # 2) Create a separate queue for cross-process logs
-    log_queue = mp.Queue()
-
-    # 3) Start a background thread to consume logs from worker processes
-    log_thread = threading.Thread(target=log_receiver, args=(log_queue,), daemon=True)
-    log_thread.start()
-    logging.info("Main process: Log receiver thread started.")
-
-    # 4) Preload/cache all required models so workers don't block on download
-    preload_models()
-
-    # 5) Build the FAISS index in main
+    # 1) Build the FAISS index
     start_time = time.time()
     with index_lock:
         docs, faiss_index = build_faiss_index()
         INDEX_READY = True
     build_time = time.time() - start_time
-    logging.info(f"Main process: FAISS index built in {build_time:.2f} seconds")
+    logging.info(f"Main: FAISS index built in {build_time:.2f} seconds.")
 
-    # 6) Detect GPUs
+    # 2) GPUs
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
-        logging.warning("No GPUs detected. Falling back to CPU. Creating one worker.")
+        logging.warning("No GPUs found, fallback to CPU.")
         num_gpus = 1
 
-    WORKER_READY[:] = [False] * num_gpus
-    logging.info(f"Main process: Launching {num_gpus} worker(s)...")
+    # 3) Load model sets
+    for g in range(num_gpus):
+        data = load_models_for_gpu(g)
+        gpu_models.append(data)
+    logging.info(f"Main: Loaded {len(gpu_models)} GPU model sets.")
 
-    # 7) Spawn the worker processes
-    for gpu_id in range(num_gpus):
-        in_q = mp.Queue()
-        out_q = mp.Queue()
-        p = mp.Process(target=worker_process, args=(gpu_id, in_q, out_q, log_queue))
-        p.start()
-        workers.append(WorkerClient(gpu_id, in_q, out_q, p))
-
-    logging.info("Main process: All worker processes started.")
-
-    # 8) Wait for each worker to signal "ready"
-    watcher_thread = threading.Thread(target=watch_workers_loaded, args=(workers,))
-    watcher_thread.daemon = True
-    watcher_thread.start()
-
-    # 9) Start the FastAPI/Uvicorn server
-    logging.info("Main process: Starting FastAPI server on port 8000.")
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=600)
-    finally:
-        # Send None to log_queue so our log thread exits
-        log_queue.put(None)
-        log_thread.join()
-        logging.info("Main process: Log receiver thread stopped.")
+    # 4) Start single-process Uvicorn
+    logging.info("Main: Starting server on port 8000.")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=1
+    )
