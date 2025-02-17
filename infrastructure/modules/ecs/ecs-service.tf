@@ -9,13 +9,10 @@ resource "aws_ecs_service" "rag_service" {
   desired_count   = 1
   launch_type     = "EC2"
 
-  # ALB config
   load_balancer {
     target_group_arn = var.target_group_arn
     container_name   = "rag-container"
     container_port   = 8000
   }
-
-  # Give it some time to load the index and models
   health_check_grace_period_seconds = 600
 }
