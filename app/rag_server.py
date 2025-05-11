@@ -38,7 +38,8 @@ gpu_index = 0  # Round-robin across GPUs
 MODEL_MAX_LENGTH = 1024       # DialoGPT context window (small model)
 NEW_TOKENS = 150              # We want 150 tokens for the generation tail
 PROMPT_MAX_TOKENS = MODEL_MAX_LENGTH - NEW_TOKENS  # 874
-K_RETRIEVE = 1                # We'll retrieve top-2 passages from FAISS
+K_RETRIEVE = 2                # We'll retrieve top-2 passages from FAISS
+MODEL_NAME = "microsoft/DialoGPT-medium"
 
 # ------------------------
 # Logging
@@ -106,7 +107,6 @@ def load_models_for_gpu(gpu_id: int):
     logging.info(f"Main: Loading models for GPU {gpu_id} on device {device}...")
 
     # Generative model
-    MODEL_NAME = "microsoft/DialoGPT-small"
     gen_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if gen_tokenizer.pad_token is None:
         gen_tokenizer.pad_token = gen_tokenizer.eos_token
@@ -230,9 +230,7 @@ def rag_endpoint(request: QueryRequest):
             enc["input_ids"],
             attention_mask=enc["attention_mask"],
             max_new_tokens=NEW_TOKENS,
-            min_new_tokens=10,
-            do_sample=True,
-            temperature=0.7
+            do_sample=True
         )
     total_len = out_ids.shape[1]
     generated_len = total_len - prompt_len
@@ -250,7 +248,6 @@ def rag_endpoint(request: QueryRequest):
     # decode just those, strip whitespace
     final_answer = gen_tok.decode(final_tokens, skip_special_tokens=True).strip()
     logging.info(f"Main : RAG job={job_id} -> final answer='{final_answer}'")
-    logging.info(f"Main : RAG job={job_id} -> whole answer={gen_tok.decode(out_ids, skip_special_tokens=True).strip()}")
     logging.info(f"Main: RAG job={job_id} completed. Returning last {NEW_TOKENS} tokens only.")
     return {"answer": final_answer}
 
