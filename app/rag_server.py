@@ -38,7 +38,7 @@ gpu_index = 0  # Round-robin across GPUs
 MODEL_MAX_LENGTH = 1024       # DialoGPT context window (small model)
 NEW_TOKENS = 150              # We want 150 tokens for the generation tail
 PROMPT_MAX_TOKENS = MODEL_MAX_LENGTH - NEW_TOKENS  # 874
-K_RETRIEVE = 2                # We'll retrieve top-2 passages from FAISS
+K_RETRIEVE = 1                # We'll retrieve top-2 passages from FAISS
 
 # ------------------------
 # Logging
@@ -190,7 +190,7 @@ def rag_endpoint(request: QueryRequest):
         cleaned_query,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=PROMPT_MAX_TOKENS,
         padding="longest"
     ).to(device)
 
@@ -230,9 +230,9 @@ def rag_endpoint(request: QueryRequest):
             enc["input_ids"],
             attention_mask=enc["attention_mask"],
             max_new_tokens=NEW_TOKENS,
-            num_beams=1,
-            do_sample=False,
-            early_stopping=True,
+            min_new_tokens=10,
+            do_sample=True,
+            temperature=0.7
         )
     total_len = out_ids.shape[1]
     generated_len = total_len - prompt_len
