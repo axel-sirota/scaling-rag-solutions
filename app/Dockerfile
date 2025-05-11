@@ -18,16 +18,6 @@ RUN apt-get update && apt-get install -y \
     wget \
     python3-dev
 
-# # Download and build SWIG version 4.0.2
-# RUN wget https://github.com/swig/swig/archive/refs/tags/rel-4.0.2.tar.gz && \
-#     tar -xzvf rel-4.0.2.tar.gz && \
-#     cd swig-rel-4.0.2 && \
-#     ./autogen.sh && \
-#     ./configure --prefix=/usr/local && \
-#     make -j$(nproc) && \
-#     make install && \
-#     cd .. && rm -rf swig-rel-4.0.2 rel-4.0.2.tar.gz
-
 RUN pip install torch  --index-url https://download.pytorch.org/whl/cu126
 # Install Python dependencies.
 RUN pip install -r requirements.txt
