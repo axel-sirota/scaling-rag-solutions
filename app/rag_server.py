@@ -249,8 +249,8 @@ def rag_endpoint(request: QueryRequest):
         final_tokens = new_tokens
     # decode just those, strip whitespace
     final_answer = gen_tok.decode(final_tokens, skip_special_tokens=True).strip()
-    logging.debug(f"Main: RAG job={job_id} -> final answer='{final_answer}'")
-    logging.debug(f"Main: RAG job={job_id} -> whole answer={gen_tok.decode(out_ids, skip_special_tokens=True).strip()}")
+    logging.info(f"Main: RAG job={job_id} -> final answer='{final_answer}'")
+    logging.info(f"Main: RAG job={job_id} -> whole answer={gen_tok.decode(out_ids, skip_special_tokens=True).strip()}")
     logging.info(f"Main: RAG job={job_id} completed. Returning last {NEW_TOKENS} tokens only.")
     return {"answer": final_answer}
 
