@@ -240,16 +240,15 @@ def rag_endpoint(request: QueryRequest):
 
     if generated_len <= 0:
         # No new tokens generated
-        final_tokens = out_ids[0, -1:]
+        raise ValueError("No new tokens generated. Check the model and input.")
     else:
         new_tokens = out_ids[0, prompt_len:]
         # If it somehow generated more than 150, keep last 150
         if new_tokens.shape[0] > NEW_TOKENS:
             new_tokens = new_tokens[-NEW_TOKENS:]
         final_tokens = new_tokens
-
-    final_answer = gen_tok.decode(out_ids[0], skip_special_tokens=True)
-
+    # decode just those, strip whitespace
+    final_answer = gen_tok.decode(final_tokens, skip_special_tokens=True).strip()
     logging.info(f"Main: RAG job={job_id} completed. Returning last {NEW_TOKENS} tokens only.")
     return {"answer": final_answer}
 

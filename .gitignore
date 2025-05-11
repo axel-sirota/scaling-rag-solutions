@@ -175,6 +175,7 @@ cython_debug/
 
 **/.terraform/*
 **/.terraform/providers
-infrastucture/.terraform.lock.hcl
-infrastucture/terraform.tfstate
-infrastucture/terraform.tfstate.backup
+infrastructure/.terraform.lock.hcl
+infrastructure/terraform.tfstate
+infrastructure/terraform.tfstate.backup
+infrastructure/terraform.tfstate
