@@ -1,7 +1,7 @@
 #!/bin/bash
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 253957294717.dkr.ecr.us-east-1.amazonaws.com
 TAG=$(openssl rand -hex 12)
-docker build -t scaled-rag-qwen:$TAG .
+docker build -f Dockerfile_qwen -t scaled-rag-qwen:$TAG .
 docker tag scaled-rag-qwen:$TAG scaled-rag-qwen:latest
 docker tag scaled-rag-qwen:$TAG 253957294717.dkr.ecr.us-east-1.amazonaws.com/scaled-rag-repo:qwen-$TAG
 docker tag scaled-rag-qwen:latest 253957294717.dkr.ecr.us-east-1.amazonaws.com/scaled-rag-repo:qwen-latest
