@@ -29,4 +29,4 @@ RUN pip install transformers>=4.51.0
 COPY . /app
 
 EXPOSE 8000
-CMD ["python", "rag_server.py"]
+CMD ["python", "rag_server_qwen.py"]
