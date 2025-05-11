@@ -103,8 +103,8 @@ def load_models_for_gpu(gpu_id: int):
     gen_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         trust_remote_code=True,
-        torch_dtype="auto",
-    ).eval()
+        torch_dtype="auto"
+    ).to(device).eval()
 
     # Embedding model
     emb_name = "sentence-transformers/all-MiniLM-L6-v2"
@@ -113,7 +113,7 @@ def load_models_for_gpu(gpu_id: int):
 
     logging.info(f"Models loaded on {device}.")
     return {"device": device, "gen_tokenizer": gen_tok, "gen_model": gen_model,
-            "emb_tokenizer": emb_tok, "emb_model": emb_model}
+            "emb_tokenizer": emb_tok, "emb_model": emb_model, "emb_name": emb_name, "gpu_id": gpu_id, "model_name": MODEL_NAME}
 
 # Text cleaning for embedding
 
@@ -139,17 +139,18 @@ def health_check():
 
 @app.get("/models_ready")
 def models_ready():
+    global gpu_models, ready
     logging.debug("Models_ready endpoint called.")
     ready = len(gpu_models) > 0
-    logging.info(f"Models ready: {ready}, num_gpus={len(gpu_models)}.")
-    return {"num_gpus": len(gpu_models), "gpu_ids": list(range(len(gpu_models)))}
+    logging.info(f"Models ready: {ready}, num_gpus={len(gpu_models)}, model={gpu_models[0]["model_name"]}.")
+    return {"num_gpus": len(gpu_models), "gpu_ids": list(range(len(gpu_models))), "ready": ready, "model": gpu_models[0]["model_name"]}
 
 class QueryRequest(BaseModel):
     query: str
 
 @app.post("/rag")
 def rag_endpoint(request: QueryRequest):
-    global gpu_index
+    global gpu_index, gpu_models
     logging.info("/rag called with query: '%s'", request.query)
     with index_lock:
         if not INDEX_READY:
@@ -217,7 +218,7 @@ def rag_endpoint(request: QueryRequest):
     thinking = gen_tok.decode(new[:idx_end], skip_special_tokens=True).strip()
     content = gen_tok.decode(new[idx_end:], skip_special_tokens=True).strip()
     logging.info(f"RAG job {job_id} answer: {content}")
-
+    logging.debug(f"RAG job {job_id} thinking: {thinking}")
     return {"answer": content}
 
 # ------------------------
