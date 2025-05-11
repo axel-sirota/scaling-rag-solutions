@@ -103,8 +103,7 @@ def load_models_for_gpu(gpu_id: int):
     gen_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
-        device_map={0: device}
+        torch_dtype="auto",
     ).eval()
 
     # Embedding model

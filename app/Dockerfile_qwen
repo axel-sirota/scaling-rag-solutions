@@ -23,7 +23,7 @@ RUN pip install torch  --index-url https://download.pytorch.org/whl/cu126
 RUN pip install -r requirements.txt
 
 RUN pip install faiss-cpu
-RUN pip install transformers>=4.51.0
+RUN pip install "transformers==4.51.3"
 
 # Copy the rest of your application.
 COPY . /app
