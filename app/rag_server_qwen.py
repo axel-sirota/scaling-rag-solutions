@@ -150,6 +150,7 @@ class QueryRequest(BaseModel):
 
 @app.post("/rag")
 def rag_endpoint(request: QueryRequest):
+    global gpu_index
     logging.info("/rag called with query: '%s'", request.query)
     with index_lock:
         if not INDEX_READY:
@@ -163,7 +164,6 @@ def rag_endpoint(request: QueryRequest):
     idx = gpu_index % len(gpu_models)
     gpu_index_plus = gpu_index + 1
     logging.debug(f"Selecting GPU index {idx} (next will be {gpu_index_plus}).")
-    global gpu_index
     gpu_index = gpu_index_plus
 
     model_data = gpu_models[idx]
