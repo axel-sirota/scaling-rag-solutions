@@ -57,8 +57,8 @@ init_logging()
 # ------------------------
 def build_faiss_index():
     logging.info("Building FAISS index...")
-    dataset = load_dataset("rag-datasets/rag-mini-bioasq", "text-corpus", split="passages")
-    passages = [doc["passage"] for doc in dataset][:2000]
+    dataset = load_dataset("rag-datasets/rag-mini-wikipedia", "text-corpus", split="passages")
+    passages = [doc["passage"] for doc in dataset]
     logging.debug(f"Loaded {len(passages)} passages for indexing.")
 
     # CPU embed model
