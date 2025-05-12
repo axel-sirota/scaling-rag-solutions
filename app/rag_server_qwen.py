@@ -142,7 +142,7 @@ def models_ready():
     global gpu_models, ready
     logging.debug("Models_ready endpoint called.")
     ready = len(gpu_models) > 0
-    logging.info(f"Models ready: {ready}, num_gpus={len(gpu_models)}, model={gpu_models[0]["model_name"]}.")
+    logging.info(f'Models ready: {ready}, num_gpus={len(gpu_models)}, model={gpu_models[0]["model_name"]}.')
     return {"num_gpus": len(gpu_models), "gpu_ids": list(range(len(gpu_models))), "ready": ready, "model": gpu_models[0]["model_name"]}
 
 class QueryRequest(BaseModel):
