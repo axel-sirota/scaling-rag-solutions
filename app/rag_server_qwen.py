@@ -33,10 +33,6 @@ index_lock = threading.Lock()
 gpu_models = []
 gpu_index = 0  # Round-robin across GPUs
 
-# Qwen-3-0.6B supports 4096 tokens context
-MODEL_MAX_LENGTH = 4096
-NEW_TOKENS = 150
-PROMPT_MAX_TOKENS = MODEL_MAX_LENGTH - NEW_TOKENS  # 3946
 K_RETRIEVE = 2
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -197,28 +193,28 @@ def rag_endpoint(request: QueryRequest):
     text = gen_tok.apply_chat_template(messages, tokenize=False,
                                        add_generation_prompt=True,
                                        enable_thinking=True)
-    inputs = gen_tok([text], return_tensors="pt",
-                      truncation=True, max_length=PROMPT_MAX_TOKENS).to(device)
+    inputs = gen_tok([text], return_tensors="pt").to(device)
     logging.debug(f"Prompt tokens: {inputs.input_ids.shape[1]}.")
 
     # Step 4: generate
     start_gen = time.time()
-    out_ids = gen_model.generate(**inputs, max_new_tokens=NEW_TOKENS,
+    out_ids = gen_model.generate(**inputs, max_new_tokens=5000,
                                  do_sample=False, early_stopping=True)
     gen_time = time.time() - start_gen
     logging.info(f"Generated sequence in {gen_time:.2f}s; total tokens {out_ids.shape[1]}.")
-
-    # isolate new tokens
-    new = out_ids[0, inputs.input_ids.shape[1]:].tolist()
-    logging.debug(f"New token count: {len(new)}.")
+    output_ids = out_ids[0][len(inputs.input_ids[0]):].tolist() 
+    # parsing thinking content
     try:
-        idx_end = len(new) - new[::-1].index(gen_tok.eos_token_id)
+        # rindex finding 151668 (</think>)
+        index = len(output_ids) - output_ids[::-1].index(151668)
     except ValueError:
-        idx_end = 0
-    thinking = gen_tok.decode(new[:idx_end], skip_special_tokens=True).strip()
-    content = gen_tok.decode(new[idx_end:], skip_special_tokens=True).strip()
+        index = 0
+
+    thinking_content = gen_tok.decode(output_ids[:index], skip_special_tokens=True).strip("\n")
+    content = gen_tok.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
+
     logging.info(f"RAG job {job_id} answer: {content}")
-    logging.debug(f"RAG job {job_id} thinking: {thinking}")
+    logging.debug(f"RAG job {job_id} thinking: {thinking_content}")
     return {"answer": content}
 
 # ------------------------
