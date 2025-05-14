@@ -8,7 +8,7 @@ resource "aws_ecs_task_definition" "rag_task" {
   container_definitions = jsonencode([
     {
       name         = "rag-container"
-      image        = "253957294717.dkr.ecr.us-east-1.amazonaws.com/scaled-rag-repo:latest"
+      image        = "253957294717.dkr.ecr.us-east-1.amazonaws.com/scaled-rag-repo:qwen-latest"
       essential    = true
       memory       = 8192
       cpu          = 4096
